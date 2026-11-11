@@ -227,3 +227,7 @@ data/*
 # Pipeline outputs (derived from report data)
 results/
 
+# Ollama/matcher config: machine-specific (base_url, model), keep out of VCS
+config/
+
+logs/

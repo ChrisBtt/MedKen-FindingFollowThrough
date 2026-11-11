@@ -8,7 +8,13 @@
 
 * [ ] Files
 
-| File | What | Who opens it | |---|---|---| | `Synthetic_Finding_Cases_v0.2.xlsx` | One row per case: narrative, lesions and conclusions, what the case tests; a modality coverage tab | Everyone — the index | | `reports.md` / `reports.json` | The report texts, per case and exam, as a radiologist or pathologist would have written them | The tester, to check records against source | | `records_clean.json` | The extracted records: one per finding statement, in the FT-DM shape — `finding_id`, `exam_id`, `modality`, `laterality`, `site`, `finding_type`, `location{quadrant, clock, depth, fn_cm, extent, view_basis, stated_as}`, `size_mm`, `descriptors`, `status_statement`, `correspondence[]`, `assessment_literal`, `recommendation_literal`, `specimen` (pathology only), `retrospective_note` (rare); field syntax in `metadata.conventions` | The tester — this is the input | | `answer_key.json` | Ground truth per case: lesion chains, non-lesions, candidate-only links, review triggers, traps, expected behavior | Closed until a results table exists | | `FFT_Action-Plan_Christoph_v0.1.md` | How to run the test and what to report | The tester |
+| File | What | Who opens it | 
+|---|---|---| 
+| `Synthetic_Finding_Cases_v0.2.xlsx` | One row per case: narrative, lesions and conclusions, what the case tests; a modality coverage tab | Everyone — the index |
+| `reports.md` / `reports.json` | The report texts, per case and exam, as a radiologist or pathologist would have written them | The tester, to check records against source |
+| `records_clean.json` | The extracted records: one per finding statement, in the FT-DM shape — `finding_id`, `exam_id`, `modality`, `laterality`, `site`, `finding_type`, `location{quadrant, clock, depth, fn_cm, extent, view_basis, stated_as}`, `size_mm`, `descriptors`, `status_statement`, `correspondence[]`, `assessment_literal`, `recommendation_literal`, `specimen` (pathology only), `retrospective_note` (rare); field syntax in `metadata.conventions` | The tester — this is the input |
+| `answer_key.json` | Ground truth per case: lesion chains, non-lesions, candidate-only links, review triggers, traps, expected behavior | Closed until a results table exists |
+| `FFT_Action-Plan_Christoph_v0.1.md` | How to run the test and what to report | The tester |
 
 ## Reading the records
 
