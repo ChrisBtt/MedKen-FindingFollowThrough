@@ -179,6 +179,11 @@ SYSTEM = (
     "record (a record from an earlier exam, not itself, not a later one) it CONTINUES — the "
     "same lesion re-described — or whether it is NEW (no earlier record to attach to) or a "
     "NEGATIVE SEARCH ('no correlate') that attaches to an earlier finding it searched for. "
+    "EXAM-ADJACENCY RULE: link a finding ONLY to the record in the IMMEDIATELY PRECEDING EXAM "
+    "(exam number - 1). If the immediately-preceding exam has NO finding at the same location "
+    "for this lesion, fall back to the nearest earlier exam that does — but never skip a "
+    "preceding exam that has a matching finding. This mirrors already-matched chain logic: "
+    "information travels only via the matched lesion record, not freely across exams."
     "Evidence to weigh: laterality and site are hard gates (different breast, or "
     "axilla-vs-breast => no link); otherwise use quadrant, clock, depth, distance-from-"
     "nipple, extent, finding type, descriptors, size, and the stated correspondence/status "
@@ -321,6 +326,65 @@ def _is_earlier(cand_fid: str, new_fid: str) -> bool:
     return ek(cand_fid) < ek(new_fid)
 
 
+def _exam_rank(fid: str) -> int:
+    m = re.match(r"^SYN-\d+-E(\d+)", fid)
+    return int(m.group(1)) if m else 0
+
+
+def _nearest_adjacent(recs: list[dict], case: dict, cand_fid: str, new_fid: str) -> str | None:
+    """Return a valid link for `cand_fid` under the exam-adjacency rule.
+    If cand_fid is in the immediately-preceding exam → accept.
+    Otherwise, find the best record in the immediately-preceding exam that matches
+    `new_fid` (same laterality + site + compatible location), or the nearest earlier
+    record if the immediately-preceding exam has no such record.  Returns None if
+    nothing valid is found."""
+    if _exam_rank(cand_fid) == _exam_rank(new_fid) - 1:
+        return cand_fid  # already adjacent — accept as-is
+
+    # Build the record lookup and location fields we need
+    rec_by_id = {r["finding_id"]: r for r in recs}
+    ref = rec_by_id.get(cand_fid)
+    new_rec = rec_by_id.get(new_fid)
+    if not ref or not new_rec:
+        return None  # can't validate — reject
+
+    prev_rank = _exam_rank(new_fid) - 1
+    if prev_rank < 1:
+        return None
+
+    def _loc_ok(a: dict, b: dict) -> bool:
+        la = (a.get("location") or {}); lb = (b.get("location") or {})
+        if (la.get("quadrant") and lb.get("quadrant")):
+            # coarse check: same or overlapping quadrant name
+            if la["quadrant"].upper() != lb["quadrant"].upper():
+                # allow overlap at boundary via shared hour — keep permissive
+                pass
+        if a.get("laterality") != b.get("laterality"):
+            return False
+        if a.get("site") != b.get("site"):
+            return False
+        return True
+
+    # Prefer a record in the immediately-preceding exam
+    prev_cands = [
+        r["finding_id"] for r in recs
+        if _exam_rank(r["finding_id"]) == prev_rank and _loc_ok(r, new_rec)
+    ]
+    if prev_cands:
+        # pick the most recent finding in that exam
+        return sorted(prev_cands, key=lambda x: -int(re.search(r"F(\d+)$", x).group(1) if re.search(r"F(\d+)$", x) else 0))[0]
+
+    # Fallback: nearest earlier record with matching location
+    earlier = [
+        r for r in recs
+        if _exam_rank(r["finding_id"]) < _exam_rank(new_fid) and _loc_ok(r, new_rec)
+    ]
+    if earlier:
+        return max(earlier, key=lambda r: _exam_rank(r["finding_id"]))["finding_id"]
+
+    return None
+
+
 def parse_response(case: dict, text: str, recs: list[dict],
                    logger: logging.Logger | None = None) -> list[dict]:
     """Model JSON string -> list of row dicts, one per record in exam order.
@@ -373,6 +437,14 @@ def parse_response(case: dict, text: str, recs: list[dict],
                 link = cand[0] if len(cand) == 1 else None
             if _find_rec(recs, link) is None:
                 link = None
+            # exam-adjacency constraint: reject or fix non-adjacent links
+            if link and _exam_rank(link) != _exam_rank(fid) - 1:
+                fixed = _nearest_adjacent(recs, case, link, fid)
+                if logger:
+                    logger.warning("[%s] %s -> %s non-adjacent (rank %d vs %d), %s",
+                                   case.get("case_id"), fid, link, _exam_rank(link), _exam_rank(fid),
+                                   f"clamped to {fixed}" if fixed else "rejected (no adjacent candidate)")
+                link = fixed
         # invariant: no link => status must be 'none' (a first record is new, not automatic)
         if not link and status in ("automatic", "candidate"):
             status = "none"

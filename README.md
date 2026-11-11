@@ -15,49 +15,125 @@
 | `records_clean.json` | The extracted records: one per finding statement, in the FT-DM shape — `finding_id`, `exam_id`, `modality`, `laterality`, `site`, `finding_type`, `location{quadrant, clock, depth, fn_cm, extent, view_basis, stated_as}`, `size_mm`, `descriptors`, `status_statement`, `correspondence[]`, `assessment_literal`, `recommendation_literal`, `specimen` (pathology only), `retrospective_note` (rare); field syntax in `metadata.conventions` | The tester — this is the input |
 | `answer_key.json` | Ground truth per case: lesion chains, non-lesions, candidate-only links, review triggers, traps, expected behavior | Closed until a results table exists |
 | `FFT_Action-Plan_Christoph_v0.1.md` | How to run the test and what to report | The tester |
-| `src/records.py` | Record store: loads `records_clean.json`, validates the FT-DM shape, attaches `reports.md` per case | The matcher |
-| `src/match.py` | Ollama matcher: one model call per case → one row per finding (`status`, `link`, `score`, `rule`, `review_required`) | The tester |
-| `config/config.toml` | Ollama base URL, model name, temperature; input/output paths | The tester |
+| `src/records.py` | Record store: loads `records_clean.json`, validates the FT-DM shape, attaches `reports.md` per case | The matchers |
+| `src/match_llm.py` | LLM matcher (Ollama): one model call per case → one row per finding (`status`, `link`, `score`, `rule`, `review_required`) | The tester |
+| `src/match_rules.py` | Deterministic rule-based matcher: hard gates (laterality/site/location) + scored rules, same row schema, no model, runs in <0.1 s | The tester, for comparison |
+| `src/evaluate.py` | Scores either result table against `answer_key.json` (P/R/F1) and renders the summary figure | The tester |
+| `config/config.toml` | Ollama base URL, model name, temperature; input/output paths (LLM matcher only) | The tester |
 | `tests/test_records.py`, `tests/test_match.py` | Offline self-checks (no model calls) | The tester, `pytest tests/` |
-| `results/matching_results.json` | The result table, one row per finding of all 20 cases | The tester — the deliverable |
-| `logs/match.log` | DEBUG-level pipeline trace (every prompt field, the raw model response, every parse decision) | When defending a score |
+| `results/matching_results.json` | LLM matcher result table, one row per finding of all 20 cases | The tester — the deliverable |
+| `results/matching_rules.json` | Rule-based matcher result table, one row per finding of all 20 cases | The tester — the comparison |
+| `logs/match_llm.log`, `logs/match_rules.log` | DEBUG-level pipeline traces (prompt fields, raw model response, per-row parse decisions) | When defending a score |
 
 ## Matching implementation (this folder)
 
-The reference matcher for the action plan's *Build* step. Reads `data/records_clean.json`, asks a local Ollama model (default `medgemma:27b`, `config/config.toml`) to decide, for each case, which *earlier* record each finding continues — and writes the result table to `results/matching_results.json`. The answer key is never part of the matching: it is a scoring reference only.
+Two reference matchers for the action plan's *Build* step, deliberately implemented on the same row schema so they score identically and can be compared head-to-head. Both read `data/records_clean.json`, decide — for each case, in exam order — which *earlier* record each finding continues, and write one row per finding. The answer key is never part of either matcher: it is a scoring reference only.
 
-**Pipeline.** `records.py` loads and validates the 144 findings, then for each case `match.py` flattens the finding lines into a one-line-per-record prompt (each line carries the FT-DM fields verbatim, plus the exam's `header_laterality` — flagged `CONFLICT` when it disagrees with the body), sends one call per case to Ollama, parses the strict-JSON response, and **enforces invariants the model may violate**: no link ⇒ `status: none`; the link must point at an *earlier* record of the *same* case; a header/body laterality conflict forces `review_required: true` and demotes `automatic → candidate` so a person sees it; unparseable output degrades to safe `none` rows instead of crashing. Each case is checkpointed to `results/cases/<case>.json`, so a re-run only redoes the cases that failed.
+**LLM matcher** (`src/match_llm.py`, Ollama, default `medgemma:27b` in `config/config.toml`). One call per case: the finding lines (FT-DM fields verbatim, plus the exam's `header_laterality`, flagged `CONFLICT` when it disagrees with the body) go into a single prompt. The model's strict-JSON response is parsed, then **invariants enforced by code**: no link ⇒ `status none`; link must be an *earlier* record of the *same* case; header/body conflict forces `review_required` and demotes `automatic → candidate`; unparseable output degrades to safe `none` rows. Each case is checkpointed to `results/cases/<case>.json`, so a re-run only redoes the cases that failed.
 
-**Status vocabulary** (chosen to score 1:1 against the answer key): `automatic` = high confidence, applies without a person · `candidate` = plausible continuation a person must confirm (hedged "may/likely", ties, negative searches) · `none` = new lesion / chain-root / nothing to attach to. A `review_required` flag marks the rows the action plan's "review triggers" call out.
+**Rule-based matcher** (`src/match_rules.py`). Deterministic, no model, <0.1 s for all 20 cases. **Exam-adjacency rule** (FT): a finding continues only from the immediately preceding exam — a lesion is never linked across a skipped exam; what may travel on is the already-matched lesion chain, not raw candidate records. Hard gates: same laterality, same site (breast-vs-axilla), compatible location (quadrant overlap / clock-within-one-hour-or-range-containment / depth within one third / distance-from-nipple within a per-modality-pair tolerance), and finding-type compatibility (incl. the documented evolutions asymmetry→mass, calcifications→non-mass-enhancement). Then scored rules: clock confirm, depth match, fn≤1 cm, same type, correspondence (affirmed +25 / hedged +15, never automatic), clip statement (pathology, strongest carrier), negative-search attach. A negated correspondence or `status: new` short-circuits to `none` (the SYN-03 trap). Ties break toward the most-recent exam / finding (the immediately-preceding-lesion reading). A header/body conflict demotes `automatic → candidate` and sets `review_required`, exactly as the LLM path. `--conservative` pins every link to `candidate` for the action plan's FT-REQ-24 reading ("nothing automatic until this stage measures it").
+
+
+### Matching rules (rule-based matcher, as implemented in `src/match_rules.py`)
+
+The decision procedure, in the exact order it runs. Every step gates the next; a finding that fails a hard gate is not a candidate at all.
+
+**Step 0 — Short-circuits (immediate `none`, no candidates considered):**
+
+- `correspondence` polarity is `negated` on any entry → **none** (SYN-03 trap: "does not correspond to…")
+- `status_statement.value == "new"` → **none** (the record itself declares it is new)
+
+**Step 1 — Candidate scan (hard gates, all must pass for a record to be a candidate):**
+
+| Gate | Rule |
+|---|---|
+| Exam rank | Only records from exams **before** the new record's exam (never the same exam) |
+| Laterality | `rec_new.laterality == rec_ref.laterality` (structural — cross-breast links are impossible, SYN-05) |
+| Site | `rec_new.site == rec_ref.site` (breast vs. axilla, SYN-15) |
+| Quadrant | Both have a quadrant → hour-ranges must **overlap** on the 12-h circle (boundary hours 12/3/6/9 count as shared with both adjacent quadrants); one missing → no constraint from this gate |
+| Clock | Both have a clock value → point vs. range: point must be **inside** the range; point vs. point: angular difference ≤ `CLOCK_TOL_H`; boundary hour matches both adjacent quadrants |
+| Depth | Both have a depth → same depth-third (anterior/middle/posterior); ABUS depth-from-skin → excluded (no constraint) |
+| Distance from nipple | Both have a numeric value → `|fn_a − fn_b|` ≤ per-modality-pair tolerance (cm) |
+| Finding type | `rec_new.type == rec_ref.type`, **or** a documented evolution: asymmetry→mass, calcifications→non-mass-enhancement |
+
+**Distance-from-nipple tolerances (cm), keyed by modality pair:**
+
+| Pair | cm | Pair | cm |
+|---|---|---|---|
+| MG ↔ US | **2.0** | US ↔ MRI | **3.0** |
+| MG ↔ MRI | **3.0** | ABUS ↔ ABUS | **1.5** |
+| all other pairs | **2.5** | | |
+
+**Step 2 — Exam-adjacency restriction:**
+
+If there are ≥ 1 candidates from the **immediately preceding exam** (`rank = new_exam − 1`), candidates are **restricted to that exam only**. Fallback to the full earlier history is allowed **only** when the previous exam has no same-lesion candidate (the SYN-07 pattern: the lesion skips a mammogram that reported nothing). This is what prevents E3→E1 skips.
+
+**Step 3 — Scoring (base 50 + bonuses, applied only if ≥ 1 candidate survived):**
+
+| Bonus | Condition | Points |
+|---|---|---|
+| Clock confirm | clock passed the hard gate (point-in-range, within tolerance, or boundary) | **+15** |
+| Depth match | same depth-third | +5 |
+| Small distance difference | `|fn_a − fn_b| ≤ 1.0 cm` | +5 |
+| Type equal | `rec_new.finding_type == rec_ref.finding_type` (not just an evolution) | +5 |
+| Correspondence — affirmed, not hedged | polarity `affirmed` and certainty ≠ `hedged` | **+25** |
+| Correspondence — affirmed but hedged | polarity `affirmed` and certainty `hedged` (or "may"/"likely"/"probably" in text) | +15 |
+| Clip statement present | `finding_type == "specimen"` and `specimen.clip_statement` is set (strongest carrier, pathology) | **+25** |
+| Negative-search attach | `finding_type == "no correlate"` | +20 |
+
+**Step 4 — Status assignment (highest score wins, tie-break: most-recent exam, then most-recent finding):**
+
+| Condition | Result |
+|---|---|
+| `best_score ≥ 50` AND `best_score < 80` | `candidate` |
+| `best_score ≥ 80` — but hedged correspondence, OR tie (margin < 15 pts to runner-up) | `candidate` + `review_required` |
+| `best_score ≥ 80` AND not hedged AND no tie | `automatic` (or `candidate` in `--conservative` mode) |
+| `best_score < 50` | `none` (row carries no link) |
+
+**Step 5 — Header/body laterality conflict (evaluated after status is set, per-exam):**
+
+If the new record's exam has `header_laterality ≠ exam_laterality` (the header says R, the body describes L, or vice versa) **and** a link was produced:
+- `automatic` → **demoted to `candidate`**
+- `review_required` → **set to `true`**
+
+This is the SYN-19 trap: the body describes a left-bias but the header is "right."
+
+**Step 6 — Review triggers (all of the following force `review_required = true` on the row):**
+
+- Status is `candidate` (any cause: score in [50, 80), hedged, or tie)
+- Hedged correspondence (any score)
+- Tie with runner-up (margin < 15 pts)
+- Header/body laterality conflict (Step 5)
+
+**`--conservative` mode** (FT-REQ-24 reading): Pins all links to `candidate` regardless of score. "Nothing automatic until this stage has measured the system."
+
+**Status vocabulary** (shared by both matchers, chosen to score 1:1 against the answer key): `automatic` = high confidence, applies without a person · `candidate` = plausible continuation a person must confirm (hedged "may/likely", ties, negative searches, any score < 80) · `none` = new lesion / chain-root / nothing to attach to. A `review_required` flag marks the rows the action plan's "review triggers" call out.
+
+> **Note on LLM matcher:** The LLM path (`src/match_llm.py`) does **not** have the exam-adjacency restriction — the model can link across exams. The invariants enforced by code (no link ⇒ `none`; link must be earlier; header conflict ⇒ demotion) apply to both matchers. The rule-based matcher is the one with the full constraint stack above.
 
 ### Quick start
 
 ```bash
-# 0. Ollama is running on localhost:11434, model is pulled
-#    (if not: ollama pull medgemma:27b)
+# LLM matcher (needs Ollama on localhost:11434, medgemma:27b pulled)
+python3 src/match_llm.py SYN-01 --dry      # watch the prompt, no model call
+python3 src/match_llm.py SYN-01            # one case -> results/cases/SYN-01.json
+python3 src/match_llm.py                   # all 20 -> results/matching_results.json
+python3 src/match_llm.py                   # re-run: skips done cases, retries failed
 
-# 1. Smoke test — one case, watch the prompt first, no model call
-python3 src/match.py SYN-01 --dry
+# Rule-based matcher (no model, instant)
+python3 src/match_rules.py                 # all 20 -> results/matching_rules.json
+python3 src/match_rules.py --conservative  # FT-REQ-24 reading: every link = candidate
+python3 src/match_rules.py --score         # also P/R/F1 vs answer_key
 
-# 2. Run it (one case, then all 20)
-python3 src/match.py SYN-01
-python3 src/match.py                      # 144 rows -> results/matching_results.json
+# Score either table + render the figure
+python3 src/evaluate.py --file results/matching_results.json --fig results/evaluation_llm.svg
+python3 src/evaluate.py --file results/matching_rules.json   --fig results/evaluation_rules.svg
 
-# 3. Re-run is cheap: completed cases are skipped, only failed ones retry
-python3 src/match.py
-
-# 4. Tests (offline, no model calls)
+# Tests (offline, no model calls)
 python3 -m pytest tests/ -v
-python3 tests/test_match.py               # or standalone
-
-# Useful flags
-#   --out PATH        write the master table somewhere else
-#   --state DIR       checkpoint dir (default <out-dir>/cases)
-#   --timeout SECS    per-attempt read timeout (default 1800; the GPU is shared)
-#   --debug           also stream DEBUG detail to the console
 ```
 
-Everything writes to `logs/match.log` (DEBUG) and the console (INFO). To defend a row, find it in `results/cases/<case>.json`, then `grep <finding_id> logs/match.log` for the prompt fields that record carried, the raw model response, and the per-row parse decision (`model_status` / `model_link` before the invariants applied).
+Everything logs to `logs/match_llm.log` / `logs/match_rules.log` (DEBUG) and the console (INFO). To defend a row, find it in `results/cases/<case>.json` (LLM) or `results/cases_rules/<case>.json` (rule-based), then `grep <finding_id> logs/` for the prompt fields / rule reasons, the raw model response (LLM only), and the per-row decision.
 
 ## Reading the records
 
