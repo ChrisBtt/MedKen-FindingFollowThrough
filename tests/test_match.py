@@ -46,7 +46,7 @@ def _rows(payload: list[dict]) -> list[dict]:
 def test_first_record_is_none() -> None:
     # E1-F1 is first in the case -> no earlier record -> even 'automatic' is coerced to 'none'
     rows = _rows([{"new_record": "SYN-99-E1-F1", "status": "automatic",
-                   "link_id": None, "score": 100, "reason": "first"}])
+                   "link_id": None, "certainty": 100, "reason": "first"}])
     assert rows[0]["status"] == "none" and rows[0]["link"] is None, rows[0]
     print("ok: first record -> status 'none', no link")
 
@@ -54,7 +54,7 @@ def test_first_record_is_none() -> None:
 def test_valid_link_kept() -> None:
     rows = _rows([{"new_record": "SYN-99-E1-F1", "status": "none", "link_id": None},
                   {"new_record": "SYN-99-E2-F1", "status": "automatic",
-                   "link_id": "SYN-99-E1-F1", "score": 90}])
+                   "link_id": "SYN-99-E1-F1", "certainty": 90}])
     by = {r["new_record"]: r for r in rows}
     assert by["SYN-99-E2-F1"]["status"] == "automatic"
     assert by["SYN-99-E2-F1"]["link"] == "SYN-99-E1-F1"
@@ -65,7 +65,7 @@ def test_hallucinated_link_dropped() -> None:
     rows = _rows([
         {"new_record": "SYN-99-E1-F1", "status": "none", "link_id": None},
         {"new_record": "SYN-99-E2-F1", "status": "automatic",
-         "link_id": "SYN-99-E9-F9", "score": 80},  # E9 does not exist
+         "link_id": "SYN-99-E9-F9", "certainty": 80},  # E9 does not exist
     ])
     by = {r["new_record"]: r for r in rows}
     assert by["SYN-99-E2-F1"]["link"] is None
@@ -79,7 +79,7 @@ def test_later_record_can_not_be_link() -> None:
     # E1-F1 cannot link to E2-F1 (later) — assert the parser refuses a LATER link.
     rows = _rows([
         {"new_record": "SYN-99-E1-F1", "status": "automatic",
-         "link_id": "SYN-99-E2-F1", "score": 70},  # E2 is LATER than E1 -> invalid
+         "link_id": "SYN-99-E2-F1", "certainty": 70},  # E2 is LATER than E1 -> invalid
     ])
     assert rows[0]["link"] is None, rows[0]
     print("ok: a LATER record is not accepted as a link")
@@ -111,7 +111,7 @@ def test_header_conflict_triggers_review() -> None:
     # model says automatic for E2-F1, but the header conflict must force review
     rows = M.parse_response(case, json.dumps([
         {"new_record": "SYN-XX-E1-F1", "status": "none", "link_id": None},
-        {"new_record": "SYN-XX-E2-F1", "status": "automatic", "link_id": "SYN-XX-E1-F1", "score": 100},
+        {"new_record": "SYN-XX-E2-F1", "status": "automatic", "link_id": "SYN-XX-E1-F1", "certainty": 100},
     ]), recs)
     e2 = {r["new_record"]: r for r in rows}["SYN-XX-E2-F1"]
     assert e2["review_required"] is True, e2

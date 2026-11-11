@@ -15,6 +15,49 @@
 | `records_clean.json` | The extracted records: one per finding statement, in the FT-DM shape — `finding_id`, `exam_id`, `modality`, `laterality`, `site`, `finding_type`, `location{quadrant, clock, depth, fn_cm, extent, view_basis, stated_as}`, `size_mm`, `descriptors`, `status_statement`, `correspondence[]`, `assessment_literal`, `recommendation_literal`, `specimen` (pathology only), `retrospective_note` (rare); field syntax in `metadata.conventions` | The tester — this is the input |
 | `answer_key.json` | Ground truth per case: lesion chains, non-lesions, candidate-only links, review triggers, traps, expected behavior | Closed until a results table exists |
 | `FFT_Action-Plan_Christoph_v0.1.md` | How to run the test and what to report | The tester |
+| `src/records.py` | Record store: loads `records_clean.json`, validates the FT-DM shape, attaches `reports.md` per case | The matcher |
+| `src/match.py` | Ollama matcher: one model call per case → one row per finding (`status`, `link`, `score`, `rule`, `review_required`) | The tester |
+| `config/config.toml` | Ollama base URL, model name, temperature; input/output paths | The tester |
+| `tests/test_records.py`, `tests/test_match.py` | Offline self-checks (no model calls) | The tester, `pytest tests/` |
+| `results/matching_results.json` | The result table, one row per finding of all 20 cases | The tester — the deliverable |
+| `logs/match.log` | DEBUG-level pipeline trace (every prompt field, the raw model response, every parse decision) | When defending a score |
+
+## Matching implementation (this folder)
+
+The reference matcher for the action plan's *Build* step. Reads `data/records_clean.json`, asks a local Ollama model (default `medgemma:27b`, `config/config.toml`) to decide, for each case, which *earlier* record each finding continues — and writes the result table to `results/matching_results.json`. The answer key is never part of the matching: it is a scoring reference only.
+
+**Pipeline.** `records.py` loads and validates the 144 findings, then for each case `match.py` flattens the finding lines into a one-line-per-record prompt (each line carries the FT-DM fields verbatim, plus the exam's `header_laterality` — flagged `CONFLICT` when it disagrees with the body), sends one call per case to Ollama, parses the strict-JSON response, and **enforces invariants the model may violate**: no link ⇒ `status: none`; the link must point at an *earlier* record of the *same* case; a header/body laterality conflict forces `review_required: true` and demotes `automatic → candidate` so a person sees it; unparseable output degrades to safe `none` rows instead of crashing. Each case is checkpointed to `results/cases/<case>.json`, so a re-run only redoes the cases that failed.
+
+**Status vocabulary** (chosen to score 1:1 against the answer key): `automatic` = high confidence, applies without a person · `candidate` = plausible continuation a person must confirm (hedged "may/likely", ties, negative searches) · `none` = new lesion / chain-root / nothing to attach to. A `review_required` flag marks the rows the action plan's "review triggers" call out.
+
+### Quick start
+
+```bash
+# 0. Ollama is running on localhost:11434, model is pulled
+#    (if not: ollama pull medgemma:27b)
+
+# 1. Smoke test — one case, watch the prompt first, no model call
+python3 src/match.py SYN-01 --dry
+
+# 2. Run it (one case, then all 20)
+python3 src/match.py SYN-01
+python3 src/match.py                      # 144 rows -> results/matching_results.json
+
+# 3. Re-run is cheap: completed cases are skipped, only failed ones retry
+python3 src/match.py
+
+# 4. Tests (offline, no model calls)
+python3 -m pytest tests/ -v
+python3 tests/test_match.py               # or standalone
+
+# Useful flags
+#   --out PATH        write the master table somewhere else
+#   --state DIR       checkpoint dir (default <out-dir>/cases)
+#   --timeout SECS    per-attempt read timeout (default 1800; the GPU is shared)
+#   --debug           also stream DEBUG detail to the console
+```
+
+Everything writes to `logs/match.log` (DEBUG) and the console (INFO). To defend a row, find it in `results/cases/<case>.json`, then `grep <finding_id> logs/match.log` for the prompt fields that record carried, the raw model response, and the per-row parse decision (`model_status` / `model_link` before the invariants applied).
 
 ## Reading the records
 

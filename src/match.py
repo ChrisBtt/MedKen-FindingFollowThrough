@@ -246,10 +246,10 @@ def build_prompt(case: dict, logger: logging.Logger | None = None) -> tuple[str,
         ' "new_record": "<finding_id>",'
         ' "status": "automatic"|"candidate"|"none",'
         ' "link_id": "<an EARLIER finding_id, or null>",'
-        ' "score": <0-100 integer>,'
+        ' "certainty": <0-100 integer>,'
         ' "reason": "<the decisive rule and the fields it read, <=30 words>"'
         "}"
-        "\nstatus: automatic = this record continues an EARLIER record with high confidence and may be applied without a person; "
+        "\nstatus: automatic = this record continues an EARLIER record with high confidence and may be applied without physician review; "
         "candidate = a plausible continuation a person must confirm (use for hedged 'may/likely' statements, ties "
         "between two earlier records, or a negative search that attaches to an earlier record); "
         "none = this is a NEW finding (no earlier record to attach to), or a negative search with nothing to attach to.\n"
@@ -355,7 +355,7 @@ def parse_response(case: dict, text: str, recs: list[dict],
         row = {
             "case_id": case["case_id"],
             "new_record": fid,
-            "status": "none", "link": None, "score": 0,
+            "status": "none", "link": None, "certainty": 0,
             "rule": model_error or "", "fields": _fields_used(rec),
             "review_required": bool(exam_flags.get(fid)),
             "model_error": model_error,
@@ -378,7 +378,7 @@ def parse_response(case: dict, text: str, recs: list[dict],
             status = "none"
         row["status"] = status
         row["rule"] = (str(obj.get("reason") or obj.get("rule") or "")).strip()
-        row["score"] = _to_int(obj.get("score"))
+        row["certainty"] = _to_int(obj.get("certainty"))
         if status in ("automatic", "candidate") and link:
             row["link"] = link
         row["review_required"] = row["review_required"] or status == "candidate"
